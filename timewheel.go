@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	zstd "github.com/klauspost/compress/zstd"
 	redis "github.com/redis/go-redis/v9"
 )
 
@@ -146,7 +147,7 @@ local name = KEYS[1]
 local id = KEYS[2]
 local tl = name .. ":tl:" .. id
 if not redis.call("SET", tl, "", "NX", "EX", ARGV[1]) then
-	return {"0"}
+	return {}
 end
 local t = name .. ":t:" .. id
 local circle = redis.call("HINCRBY", t, "circle", -1)
@@ -159,9 +160,9 @@ if circle < 0 then
 	redis.call("SREM", s, id)
 	local job = redis.call("HGET", t, "job")
 	redis.call("DEL", t)
-	return {"1", job}
+	return {job}
 end
-return {"0"}
+return {}
 `)
 
 type decrTargetResp struct {
@@ -170,17 +171,23 @@ type decrTargetResp struct {
 }
 
 func parseDecrTargetResp(ss []string) (*decrTargetResp, error) {
-	if len(ss) < 1 {
+	resp := &decrTargetResp{}
+	if len(ss) == 0 {
+		return resp, nil
+	}
+	if len(ss) != 1 {
 		return nil, fmt.Errorf("decr target response length invalid: %v", ss)
 	}
-	resp := &decrTargetResp{}
-	if ss[0] == "1" {
-		if len(ss) < 2 {
-			return nil, fmt.Errorf("decr target response length invalid: %v", ss)
-		}
-		resp.done = true
-		resp.job = stringToBytes(ss[1])
+	resp.done = true
+
+	dec, _ := zstd.NewReader(nil)
+	defer dec.Close()
+	data, err := dec.DecodeAll(stringToBytes(ss[0]), make([]byte, 0, len(ss[0])))
+	if err != nil {
+		return nil, fmt.Errorf("decompress job failed: %w", err)
 	}
+
+	resp.job = data
 	return resp, nil
 }
 
@@ -236,6 +243,9 @@ func (wheel *TimeWheel) AddTimer(id string, delay time.Duration, job []byte) err
 		preLock = wheel.interval * time.Duration((target.Idx - currentPos))
 	}
 
+	enc, _ := zstd.NewWriter(nil)
+	defer enc.Close()
+
 	err := putTargetScript.Run(
 		wheel.ctx,
 		wheel.client,
@@ -245,7 +255,7 @@ func (wheel *TimeWheel) AddTimer(id string, delay time.Duration, job []byte) err
 		},
 		target.Circle,
 		target.Idx,
-		target.Job,
+		enc.EncodeAll(job, make([]byte, 0, len(job))),
 		int(wheel.getTargetExpire(delay).Seconds()),
 		int(preLock.Seconds()),
 	).Err()

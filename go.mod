@@ -2,7 +2,10 @@ module github.com/burybell/cluster-timewheel
 
 go 1.18
 
-require github.com/redis/go-redis/v9 v9.5.1
+require (
+	github.com/klauspost/compress v1.17.7
+	github.com/redis/go-redis/v9 v9.5.1
+)
 
 require (
 	github.com/cespare/xxhash/v2 v2.2.0 // indirect
