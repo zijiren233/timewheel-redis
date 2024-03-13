@@ -208,17 +208,17 @@ func (wheel *TimeWheel) autoClockTarget(id string) (*decrTargetResp, error) {
 }
 
 func (wheel *TimeWheel) proxy(it func(id string)) {
-	smembers := wheel.client.SMembers(
+	i := wheel.client.SScan(
 		wheel.ctx,
 		wheel.formatSlotKey(atomic.LoadInt64(&wheel.currentPos)),
-	)
-	if smembers.Err() != nil {
-		return
-	}
+		0,
+		"",
+		0,
+	).Iterator()
 
 	// TODO: goroutine pool
-	for _, v := range smembers.Val() {
-		it(v)
+	for i.Next(wheel.ctx) {
+		it(i.Val())
 	}
 }
 
