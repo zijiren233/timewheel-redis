@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	redsync "github.com/go-redsync/redsync/v4"
+	goredis "github.com/go-redsync/redsync/v4/redis/goredis/v9"
 	zstd "github.com/klauspost/compress/zstd"
 	redis "github.com/redis/go-redis/v9"
 )
@@ -48,6 +50,7 @@ type TimeWheel struct {
 	slotNums   int64
 	currentPos int64
 	client     *redis.Client
+	rsync      *redsync.Redsync
 	ctx        context.Context
 	cancel     context.CancelFunc
 	jobchan    chan *Job
@@ -65,6 +68,7 @@ func NewTimeWheel(client *redis.Client, name string, opts ...OptionFunc) *TimeWh
 		slotNums: 60,
 		ctx:      context.Background(),
 		jobchan:  make(chan *Job, 100),
+		rsync:    redsync.New(goredis.NewPool(client)),
 	}
 
 	for _, opt := range opts {
@@ -207,10 +211,10 @@ func (wheel *TimeWheel) autoClockTarget(id string) (*decrTargetResp, error) {
 	return parseDecrTargetResp(ss)
 }
 
-func (wheel *TimeWheel) proxy(it func(id string)) {
+func (wheel *TimeWheel) proxy(idx int64, it func(id string)) {
 	i := wheel.client.SScan(
 		wheel.ctx,
-		wheel.formatSlotKey(atomic.LoadInt64(&wheel.currentPos)),
+		wheel.formatSlotKey(idx),
 		0,
 		"",
 		0,
@@ -283,7 +287,24 @@ func (wheel *TimeWheel) Run() {
 }
 
 func (wheel *TimeWheel) execCallback() {
-	wheel.proxy(func(id string) {
+	var currentPos int64
+
+	if !atomic.CompareAndSwapInt64(&wheel.currentPos, wheel.slotNums-1, 0) {
+		currentPos = atomic.AddInt64(&wheel.currentPos, 1) - 1
+	} else {
+		currentPos = wheel.slotNums - 1
+	}
+
+	mutex := wheel.rsync.NewMutex(
+		fmt.Sprintf("%s:sl:%d", wheel.name, currentPos),
+	)
+	err := mutex.TryLock()
+	if err != nil {
+		return
+	}
+	defer func() { _, _ = mutex.Unlock() }()
+
+	wheel.proxy(currentPos, func(id string) {
 		resp, err := wheel.autoClockTarget(id)
 		if err != nil {
 			return
@@ -297,10 +318,6 @@ func (wheel *TimeWheel) execCallback() {
 			Data: resp.job,
 		}
 	})
-
-	if !atomic.CompareAndSwapInt64(&wheel.currentPos, wheel.slotNums-1, 0) {
-		atomic.AddInt64(&wheel.currentPos, 1)
-	}
 }
 
 func (wheel *TimeWheel) Stop() {
