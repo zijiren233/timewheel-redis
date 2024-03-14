@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -210,22 +211,49 @@ func (wheel *TimeWheel) autoClockTarget(id string) (*decrTargetResp, error) {
 	return parseDecrTargetResp(ss)
 }
 
+var getNeedClockTargetScript = redis.NewScript(`
+local name = KEYS[1]
+local idx = KEYS[2]
+local s = name .. ":s:" .. idx
+local ts = redis.call("SMEMBERS", s)
+local res = {}
+for _, v in ipairs(ts) do
+	local tl = name .. ":tl:" .. v
+	if redis.call("EXISTS", tl) == 0 then
+		table.insert(res, v)
+	end
+end
+return res
+`)
+
+func (wheel *TimeWheel) getNeedClockTargets(idx int64) ([]string, error) {
+	ts, err := getNeedClockTargetScript.Run(
+		wheel.ctx,
+		wheel.client,
+		[]string{
+			wheel.name,
+			strconv.FormatInt(idx, 10),
+		},
+	).StringSlice()
+	if err != nil {
+		return nil, err
+	}
+	return ts, nil
+}
+
 func (wheel *TimeWheel) proxy(ctx context.Context, idx int64, it func(id string)) {
-	i := wheel.client.SScan(
-		ctx,
-		wheel.formatSlotKey(idx),
-		0,
-		"",
-		0,
-	).Iterator()
+	ts, err := wheel.getNeedClockTargets(idx)
+	if err != nil {
+		return
+	}
 
 	// TODO: goroutine pool + wait group
-	for i.Next(wheel.ctx) {
+	for _, t := range ts {
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			it(i.Val())
+			it(t)
 		}
 	}
 }
