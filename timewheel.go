@@ -3,11 +3,10 @@ package timewheel
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"sync/atomic"
 	"time"
 
-	redsync "github.com/go-redsync/redsync/v4"
-	goredis "github.com/go-redsync/redsync/v4/redis/goredis/v9"
 	zstd "github.com/klauspost/compress/zstd"
 	redis "github.com/redis/go-redis/v9"
 )
@@ -50,7 +49,6 @@ type TimeWheel struct {
 	slotNums   int64
 	currentPos int64
 	client     *redis.Client
-	rsync      *redsync.Redsync
 	ctx        context.Context
 	cancel     context.CancelFunc
 	jobchan    chan *Job
@@ -68,7 +66,6 @@ func NewTimeWheel(client *redis.Client, name string, opts ...OptionFunc) *TimeWh
 		slotNums: 60,
 		ctx:      context.Background(),
 		jobchan:  make(chan *Job, 100),
-		rsync:    redsync.New(goredis.NewPool(client)),
 	}
 
 	for _, opt := range opts {
@@ -78,6 +75,8 @@ func NewTimeWheel(client *redis.Client, name string, opts ...OptionFunc) *TimeWh
 	if timewheel.slotNums < 1 {
 		panic("slotNums must be greater than 0")
 	}
+
+	timewheel.currentPos = rand.Int63n(timewheel.slotNums)
 
 	timewheel.ctx, timewheel.cancel = context.WithCancel(timewheel.ctx)
 
@@ -303,16 +302,6 @@ func (wheel *TimeWheel) tickPos() int64 {
 }
 
 func (wheel *TimeWheel) exec(ctx context.Context, idx int64) {
-	mutex := wheel.rsync.NewMutex(
-		fmt.Sprintf("%s:sl:%d", wheel.name, idx),
-		redsync.WithExpiry(time.Duration(wheel.slotNums-1)*wheel.interval),
-	)
-	err := mutex.TryLockContext(ctx)
-	if err != nil {
-		return
-	}
-	defer func() { _, _ = mutex.Unlock() }()
-
 	wheel.proxy(ctx, idx, func(id string) {
 		resp, err := wheel.autoClockTarget(id)
 		if err != nil {

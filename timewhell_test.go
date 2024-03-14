@@ -22,7 +22,6 @@ func TestTimeWhell(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("add timer test5")
-	tw = timewheel.NewTimeWheel(rdb, "test-timewheel")
 	err = tw.AddTimer("test65", time.Second*65, []byte("test65"))
 	if err != nil {
 		t.Fatal(err)
