@@ -310,13 +310,23 @@ func (wheel *TimeWheel) AddTimer(id string, delay time.Duration, opts ...AddTime
 		opt(&options)
 	}
 
-	currentPos := int(atomic.LoadInt64(&wheel.currentPos))
+	if delay == 0 {
+		wheel.donechan <- &Timer{
+			Id:      id,
+			Payload: options.payload,
+		}
+	}
+
+	currentPos := atomic.LoadInt64(&wheel.currentPos)
 	delaySec := int64(delay.Seconds())
-	circle := int(delaySec / int64(wheel.interval.Seconds()) / int64(wheel.slotNums))
-	idx := (currentPos + int(delaySec)/int(wheel.interval.Seconds())) % int(wheel.slotNums)
+	circle := delaySec / int64(wheel.interval.Seconds()) / wheel.slotNums
+	if delaySec/int64(wheel.interval.Seconds())%wheel.slotNums == 0 {
+		circle--
+	}
+	idx := (currentPos + delaySec/int64(wheel.interval.Seconds())) % wheel.slotNums
 
 	var preLock time.Duration
-	if idx < currentPos {
+	if idx <= currentPos {
 		preLock = wheel.interval * time.Duration(60-currentPos+idx)
 	} else {
 		preLock = wheel.interval * time.Duration(idx-currentPos)
