@@ -211,18 +211,23 @@ func (wheel *TimeWheel) autoClockTarget(id string) (*decrTargetResp, error) {
 	return parseDecrTargetResp(ss)
 }
 
-func (wheel *TimeWheel) proxy(idx int64, it func(id string)) {
+func (wheel *TimeWheel) proxy(ctx context.Context, idx int64, it func(id string)) {
 	i := wheel.client.SScan(
-		wheel.ctx,
+		ctx,
 		wheel.formatSlotKey(idx),
 		0,
 		"",
 		0,
 	).Iterator()
 
-	// TODO: goroutine pool
+	// TODO: goroutine pool + wait group
 	for i.Next(wheel.ctx) {
-		it(i.Val())
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			it(i.Val())
+		}
 	}
 }
 
@@ -279,32 +284,36 @@ func (wheel *TimeWheel) Run() {
 	for {
 		select {
 		case <-ticker.C:
-			wheel.execCallback()
+			go wheel.exec(
+				wheel.ctx,
+				wheel.tickPos(),
+			)
 		case <-wheel.ctx.Done():
 			return
 		}
 	}
 }
 
-func (wheel *TimeWheel) execCallback() {
-	var currentPos int64
-
+func (wheel *TimeWheel) tickPos() int64 {
 	if !atomic.CompareAndSwapInt64(&wheel.currentPos, wheel.slotNums-1, 0) {
-		currentPos = atomic.AddInt64(&wheel.currentPos, 1) - 1
+		return atomic.AddInt64(&wheel.currentPos, 1) - 1
 	} else {
-		currentPos = wheel.slotNums - 1
+		return wheel.slotNums - 1
 	}
+}
 
+func (wheel *TimeWheel) exec(ctx context.Context, idx int64) {
 	mutex := wheel.rsync.NewMutex(
-		fmt.Sprintf("%s:sl:%d", wheel.name, currentPos),
+		fmt.Sprintf("%s:sl:%d", wheel.name, idx),
+		redsync.WithExpiry(time.Duration(wheel.slotNums-1)*wheel.interval),
 	)
-	err := mutex.TryLock()
+	err := mutex.TryLockContext(ctx)
 	if err != nil {
 		return
 	}
 	defer func() { _, _ = mutex.Unlock() }()
 
-	wheel.proxy(currentPos, func(id string) {
+	wheel.proxy(ctx, idx, func(id string) {
 		resp, err := wheel.autoClockTarget(id)
 		if err != nil {
 			return
