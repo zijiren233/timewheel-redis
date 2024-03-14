@@ -12,13 +12,6 @@ import (
 	redis "github.com/redis/go-redis/v9"
 )
 
-type Target struct {
-	Id     string
-	Circle int
-	Idx    int
-	Job    []byte
-}
-
 type OptionFunc func(*TimeWheel)
 
 func WithInterval(interval time.Duration) OptionFunc {
@@ -39,20 +32,27 @@ func WithContext(ctx context.Context) OptionFunc {
 	}
 }
 
-type Job struct {
-	Id   string
-	Data []byte
+func WithEnableEvalRO(enableEvalRO bool) OptionFunc {
+	return func(options *TimeWheel) {
+		options.enableEvalRO = enableEvalRO
+	}
+}
+
+type Timer struct {
+	Id      string
+	Payload []byte
 }
 
 type TimeWheel struct {
-	name       string
-	interval   time.Duration
-	slotNums   int64
-	currentPos int64
-	client     *redis.Client
-	ctx        context.Context
-	cancel     context.CancelFunc
-	jobchan    chan *Job
+	name         string
+	interval     time.Duration
+	slotNums     int64
+	currentPos   int64
+	client       *redis.Client
+	ctx          context.Context
+	cancel       context.CancelFunc
+	donechan     chan *Timer
+	enableEvalRO bool
 }
 
 func NewTimeWheel(client *redis.Client, name string, opts ...OptionFunc) *TimeWheel {
@@ -66,7 +66,7 @@ func NewTimeWheel(client *redis.Client, name string, opts ...OptionFunc) *TimeWh
 		interval: time.Second,
 		slotNums: 60,
 		ctx:      context.Background(),
-		jobchan:  make(chan *Job, 100),
+		donechan: make(chan *Timer, 100),
 	}
 
 	for _, opt := range opts {
@@ -84,8 +84,8 @@ func NewTimeWheel(client *redis.Client, name string, opts ...OptionFunc) *TimeWh
 	return timewheel
 }
 
-func (wheel *TimeWheel) JobChan() <-chan *Job {
-	return wheel.jobchan
+func (wheel *TimeWheel) DoneChan() <-chan *Timer {
+	return wheel.donechan
 }
 
 func (wheel *TimeWheel) getTargetLockExpire() time.Duration {
@@ -94,27 +94,6 @@ func (wheel *TimeWheel) getTargetLockExpire() time.Duration {
 	}
 	return time.Duration(wheel.slotNums) * wheel.interval
 }
-
-func (wheel *TimeWheel) formatSlotKey(index int64) string {
-	return fmt.Sprintf("%s:s:%v", wheel.name, index)
-}
-
-var putTargetScript = redis.NewScript(`
-local name = KEYS[1]
-local id = KEYS[2]
-local t = name .. ":t:" .. id
-if redis.call("EXISTS", t) == 1 then
-	return {err="already exists"}
-end
-local idx = ARGV[2]
-redis.call("HMSET", t, "circle", ARGV[1], "idx", idx, "job", ARGV[3])
-redis.call("EXPIRE", t, ARGV[4])
-local s = name .. ":s:" .. idx
-redis.call("SADD", s, id)
-local lock = name .. ":tl:" .. id
-redis.call("SET", lock, "", "EX", ARGV[5])
-return true
-`)
 
 func (wheel *TimeWheel) getTargetExpire(delay time.Duration) time.Duration {
 	return time.Duration(wheel.slotNums)*wheel.interval + delay
@@ -135,15 +114,14 @@ return true
 `)
 
 func (wheel *TimeWheel) delTarget(id string) error {
-	_, err := delTargetScript.Run(
+	return delTargetScript.Run(
 		wheel.ctx,
 		wheel.client,
 		[]string{
 			wheel.name,
 			id,
 		},
-	).Result()
-	return err
+	).Err()
 }
 
 var autoClockTargetScript = redis.NewScript(`
@@ -162,16 +140,16 @@ if circle < 0 then
 	local idx = redis.call("HGET", t, "idx")
 	local s = name .. ":s:" .. idx
 	redis.call("SREM", s, id)
-	local job = redis.call("HGET", t, "job")
+	local p = redis.call("HGET", t, "payload")
 	redis.call("DEL", t)
-	return {job}
+	return {p}
 end
 return {}
 `)
 
 type decrTargetResp struct {
-	done bool
-	job  []byte
+	done    bool
+	payload []byte
 }
 
 func parseDecrTargetResp(ss []string) (*decrTargetResp, error) {
@@ -186,12 +164,12 @@ func parseDecrTargetResp(ss []string) (*decrTargetResp, error) {
 
 	dec, _ := zstd.NewReader(nil)
 	defer dec.Close()
-	data, err := dec.DecodeAll(stringToBytes(ss[0]), make([]byte, 0, len(ss[0])))
+	payload, err := dec.DecodeAll(stringToBytes(ss[0]), make([]byte, 0, len(ss[0])))
 	if err != nil {
-		return nil, fmt.Errorf("decompress job failed: %w", err)
+		return nil, fmt.Errorf("decompress payload failed: %w", err)
 	}
 
-	resp.job = data
+	resp.payload = payload
 	return resp, nil
 }
 
@@ -227,7 +205,13 @@ return res
 `)
 
 func (wheel *TimeWheel) getNeedClockTargets(idx int64) ([]string, error) {
-	ts, err := getNeedClockTargetScript.Run(
+	var f func(ctx context.Context, c redis.Scripter, keys []string, args ...interface{}) *redis.Cmd
+	if wheel.enableEvalRO {
+		f = getNeedClockTargetScript.RunRO
+	} else {
+		f = getNeedClockTargetScript.Run
+	}
+	ts, err := f(
 		wheel.ctx,
 		wheel.client,
 		[]string{
@@ -258,40 +242,106 @@ func (wheel *TimeWheel) proxy(ctx context.Context, idx int64, it func(id string)
 	}
 }
 
-func (wheel *TimeWheel) AddTimer(id string, delay time.Duration, job []byte) error {
+type addTimerOptions struct {
+	force   bool
+	payload []byte
+}
+
+type AddTimerOption func(*addTimerOptions)
+
+// will delete old target if exists
+func WithForce() AddTimerOption {
+	return func(options *addTimerOptions) {
+		options.force = true
+	}
+}
+
+func WithPayload(payload []byte) AddTimerOption {
+	return func(options *addTimerOptions) {
+		options.payload = payload
+	}
+}
+
+var putTargetScript = redis.NewScript(`
+local name = KEYS[1]
+local id = KEYS[2]
+local t = name .. ":t:" .. id
+if redis.call("EXISTS", t) == 1 then
+	return {err="already exists"}
+end
+local idx = ARGV[2]
+redis.call("HMSET", t, "circle", ARGV[1], "idx", idx, "payload", ARGV[3])
+redis.call("EXPIRE", t, ARGV[4])
+local s = name .. ":s:" .. idx
+redis.call("SADD", s, id)
+local lock = name .. ":tl:" .. id
+redis.call("SET", lock, "", "EX", ARGV[5])
+return true
+`)
+
+// delete target if exists, then put target
+var forcePutTargetScript = redis.NewScript(`
+local name = KEYS[1]
+local id = KEYS[2]
+local t = name .. ":t:" .. id
+if redis.call("EXISTS", t) == 1 then
+	local oldIdx = redis.call("HGET", t, "idx")
+	redis.call("DEL", t)
+	local oldS = name .. ":s:" .. oldIdx
+	redis.call("SREM", oldS, id)
+end
+local idx = ARGV[2]
+redis.call("HMSET", t, "circle", ARGV[1], "idx", idx, "payload", ARGV[3])
+redis.call("EXPIRE", t, ARGV[4])
+local s = name .. ":s:" .. idx
+redis.call("SADD", s, id)
+local lock = name .. ":tl:" .. id
+redis.call("SET", lock, "", "EX", ARGV[5])
+return true
+`)
+
+func (wheel *TimeWheel) AddTimer(id string, delay time.Duration, opts ...AddTimerOption) error {
 	if delay < 0 {
 		return fmt.Errorf("delay must be greater than 0")
 	}
 
-	currentPos := int(atomic.LoadInt64(&wheel.currentPos))
-	delaySec := int64(delay.Seconds())
-	target := &Target{
-		Id:     id,
-		Circle: int(delaySec / int64(wheel.interval.Seconds()) / int64(wheel.slotNums)),
-		Idx:    (currentPos + int(delaySec)/int(wheel.interval.Seconds())) % int(wheel.slotNums),
-		Job:    job,
+	var options addTimerOptions
+	for _, opt := range opts {
+		opt(&options)
 	}
 
+	currentPos := int(atomic.LoadInt64(&wheel.currentPos))
+	delaySec := int64(delay.Seconds())
+	circle := int(delaySec / int64(wheel.interval.Seconds()) / int64(wheel.slotNums))
+	idx := (currentPos + int(delaySec)/int(wheel.interval.Seconds())) % int(wheel.slotNums)
+
 	var preLock time.Duration
-	if target.Idx < currentPos {
-		preLock = wheel.interval * time.Duration((60 - currentPos + target.Idx))
+	if idx < currentPos {
+		preLock = wheel.interval * time.Duration(60-currentPos+idx)
 	} else {
-		preLock = wheel.interval * time.Duration((target.Idx - currentPos))
+		preLock = wheel.interval * time.Duration(idx-currentPos)
 	}
 
 	enc, _ := zstd.NewWriter(nil)
 	defer enc.Close()
 
-	err := putTargetScript.Run(
+	var script *redis.Script
+	if options.force {
+		script = forcePutTargetScript
+	} else {
+		script = putTargetScript
+	}
+
+	err := script.Run(
 		wheel.ctx,
 		wheel.client,
 		[]string{
 			wheel.name,
-			target.Id,
+			id,
 		},
-		target.Circle,
-		target.Idx,
-		enc.EncodeAll(job, make([]byte, 0, len(job))),
+		circle,
+		idx,
+		enc.EncodeAll(options.payload, make([]byte, 0, len(options.payload))),
 		int(wheel.getTargetExpire(delay).Seconds()),
 		int(preLock.Seconds()),
 	).Err()
@@ -339,9 +389,9 @@ func (wheel *TimeWheel) exec(ctx context.Context, idx int64) {
 			return
 		}
 
-		wheel.jobchan <- &Job{
-			Id:   id,
-			Data: resp.job,
+		wheel.donechan <- &Timer{
+			Id:      id,
+			Payload: resp.payload,
 		}
 	})
 }
