@@ -1,4 +1,4 @@
-module github.com/burybell/cluster-timewheel
+module github.com/zijiren233/timewheel-redis
 
 go 1.18
 

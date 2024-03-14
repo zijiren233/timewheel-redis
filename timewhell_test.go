@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	timewheel "github.com/burybell/cluster-timewheel"
 	"github.com/redis/go-redis/v9"
+	timewheel "github.com/zijiren233/timewheel-redis"
 )
 
 func TestTimeWhell(t *testing.T) {
