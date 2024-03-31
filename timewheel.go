@@ -96,7 +96,7 @@ func (wheel *TimeWheel) getTargetLockExpire() time.Duration {
 }
 
 func (wheel *TimeWheel) getTargetExpire(delay time.Duration) time.Duration {
-	return time.Duration(wheel.slotNums)*wheel.interval + delay
+	return time.Duration(wheel.slotNums)*wheel.interval*2 + delay
 }
 
 var delTargetScript = redis.NewScript(`
@@ -127,6 +127,7 @@ func (wheel *TimeWheel) delTarget(id string) error {
 var autoClockTargetScript = redis.NewScript(`
 local name = KEYS[1]
 local id = KEYS[2]
+local idx = KEYS[3]
 local tl = name .. ":tl:" .. id
 if not redis.call("SET", tl, "", "NX", "EX", ARGV[1]) then
 	return {}
@@ -134,17 +135,21 @@ end
 local t = name .. ":t:" .. id
 local circle = redis.call("HINCRBY", t, "circle", -1)
 if not circle then
-	return false
-end
-if circle < 0 then
-	local idx = redis.call("HGET", t, "idx")
 	local s = name .. ":s:" .. idx
 	redis.call("SREM", s, id)
-	local p = redis.call("HGET", t, "payload")
-	redis.call("DEL", t)
-	return {p}
+	return {}
 end
-return {}
+if circle >= 0 then
+	return {}
+end
+local results = redis.call("HMGET", t, "idx", "payload")
+if not results or #results ~= 2 then
+	return {}
+end
+local s = name .. ":s:" .. results[1]
+redis.call("SREM", s, id)
+redis.call("DEL", t)
+return {results[2]}
 `)
 
 type decrTargetResp struct {
@@ -173,13 +178,14 @@ func parseDecrTargetResp(ss []string) (*decrTargetResp, error) {
 	return resp, nil
 }
 
-func (wheel *TimeWheel) autoClockTarget(id string) (*decrTargetResp, error) {
+func (wheel *TimeWheel) autoClockTarget(idx int64, id string) (*decrTargetResp, error) {
 	ss, err := autoClockTargetScript.Run(
 		wheel.ctx,
 		wheel.client,
 		[]string{
 			wheel.name,
 			id,
+			strconv.FormatInt(idx, 10),
 		},
 		int(wheel.getTargetLockExpire().Seconds()),
 	).StringSlice()
@@ -225,7 +231,7 @@ func (wheel *TimeWheel) getNeedClockTargets(idx int64) ([]string, error) {
 	return ts, nil
 }
 
-func (wheel *TimeWheel) proxy(ctx context.Context, idx int64, it func(id string)) {
+func (wheel *TimeWheel) proxy(ctx context.Context, idx int64, it func(idx int64, id string)) {
 	ts, err := wheel.getNeedClockTargets(idx)
 	if err != nil {
 		return
@@ -237,7 +243,7 @@ func (wheel *TimeWheel) proxy(ctx context.Context, idx int64, it func(id string)
 		case <-ctx.Done():
 			return
 		default:
-			it(t)
+			it(idx, t)
 		}
 	}
 }
@@ -279,17 +285,16 @@ redis.call("SET", lock, "", "EX", ARGV[5])
 return true
 `)
 
-// delete target if exists, then put target
 var forcePutTargetScript = redis.NewScript(`
 local name = KEYS[1]
 local id = KEYS[2]
 local t = name .. ":t:" .. id
-if redis.call("EXISTS", t) == 1 then
-	local oldIdx = redis.call("HGET", t, "idx")
-	redis.call("DEL", t)
+local oldIdx = redis.call("HGET", t, "idx")
+if oldIdx then
 	local oldS = name .. ":s:" .. oldIdx
 	redis.call("SREM", oldS, id)
 end
+
 local idx = ARGV[2]
 redis.call("HMSET", t, "circle", ARGV[1], "idx", idx, "payload", ARGV[3])
 redis.call("EXPIRE", t, ARGV[4])
@@ -390,8 +395,8 @@ func (wheel *TimeWheel) tickPos() int64 {
 }
 
 func (wheel *TimeWheel) exec(ctx context.Context, idx int64) {
-	wheel.proxy(ctx, idx, func(id string) {
-		resp, err := wheel.autoClockTarget(id)
+	wheel.proxy(ctx, idx, func(idx int64, id string) {
+		resp, err := wheel.autoClockTarget(idx, id)
 		if err != nil {
 			return
 		}

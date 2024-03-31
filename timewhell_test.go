@@ -98,7 +98,7 @@ func TestTimeWhell2(t *testing.T) {
 	})
 	tw := timewheel.NewTimeWheel(rdb, "test-timewheel2")
 
-	err := tw.AddTimer("test60", time.Second*60, timewheel.WithForce(), timewheel.WithPayload([]byte("test60")))
+	err := tw.AddTimer("1", time.Second*60, timewheel.WithForce(), timewheel.WithPayload([]byte("test60")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,7 @@ func TestTimeWhell2(t *testing.T) {
 
 	timer := <-tw.DoneChan()
 	t.Logf("cost time: %v", time.Since(now))
-	if timer.Id != "test60" {
+	if timer.Id != "1" {
 		t.Error("timer id not match")
 	}
 	if string(timer.Payload) != "test60" {
