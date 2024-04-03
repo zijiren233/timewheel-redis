@@ -38,6 +38,15 @@ func WithEnableEvalRO(enableEvalRO bool) OptionFunc {
 	}
 }
 
+func WithBatchSize(batchSize int) OptionFunc {
+	return func(options *TimeWheel) {
+		if batchSize < 1 {
+			return
+		}
+		options.batchSize = batchSize
+	}
+}
+
 type Timer struct {
 	Id      string
 	Payload []byte
@@ -53,6 +62,7 @@ type TimeWheel struct {
 	cancel       context.CancelFunc
 	donechan     chan *Timer
 	enableEvalRO bool
+	batchSize    int
 }
 
 func NewTimeWheel(client *redis.Client, name string, opts ...OptionFunc) *TimeWheel {
@@ -61,12 +71,13 @@ func NewTimeWheel(client *redis.Client, name string, opts ...OptionFunc) *TimeWh
 	}
 
 	timewheel := &TimeWheel{
-		client:   client,
-		name:     name,
-		interval: time.Second,
-		slotNums: 60,
-		ctx:      context.Background(),
-		donechan: make(chan *Timer, 100),
+		client:    client,
+		name:      name,
+		interval:  time.Second,
+		slotNums:  60,
+		ctx:       context.Background(),
+		donechan:  make(chan *Timer, 100),
+		batchSize: 3,
 	}
 
 	for _, opt := range opts {
@@ -195,6 +206,90 @@ func (wheel *TimeWheel) autoClockTarget(idx int64, id string) (*decrTargetResp, 
 	return parseDecrTargetResp(ss)
 }
 
+var autoClockTargetsScript = redis.NewScript(`
+local name = KEYS[1]
+local idx = KEYS[2]
+local expire = KEYS[3]
+local results = {}
+for _, id in ipairs(ARGV) do
+	local skip = false
+	local tl = name .. ":tl:" .. id
+	local t = name .. ":t:" .. id
+	local circle
+	if not redis.call("SET", tl, "", "NX", "EX", expire) then
+		skip = true
+	end
+	if not skip then
+		circle = redis.call("HINCRBY", t, "circle", -1)
+		if not circle then
+			local s = name .. ":s:" .. idx
+			redis.call("SREM", s, id)
+			skip = true
+		end
+	end
+	if not skip and circle < 0 then
+		local r = redis.call("HMGET", t, "idx", "payload")
+		if not r or #r ~= 2 then
+			skip = true
+		else
+			local s = name .. ":s:" .. r[1]
+			redis.call("SREM", s, id)
+			redis.call("DEL", t)
+			table.insert(results, id)
+			table.insert(results, r[2])
+		end
+	end
+end
+return results
+`)
+
+func parseDecrTargetsResp(ss []string) (map[string][]byte, error) {
+	if len(ss)%2 != 0 {
+		return nil, fmt.Errorf("decr targets response length invalid: %v", ss)
+	}
+
+	results := make(map[string][]byte, len(ss)/2)
+	for i := 0; i < len(ss); i += 2 {
+		id := ss[i]
+		dec, _ := zstd.NewReader(nil)
+		defer dec.Close()
+		payload, err := dec.DecodeAll(stringToBytes(ss[i+1]), make([]byte, 0, len(ss[i+1])))
+		if err != nil {
+			// return nil, fmt.Errorf("decompress payload failed: %w", err)
+			continue
+		}
+		results[id] = payload
+	}
+
+	return results, nil
+}
+
+func slice2interface[T any](s []T) []interface{} {
+	var r []interface{} = make([]interface{}, len(s))
+	for i, v := range s {
+		r[i] = v
+	}
+	return r
+}
+
+func (wheel *TimeWheel) autoClockTargets(idx int64, ids []string) (map[string][]byte, error) {
+	ss, err := autoClockTargetsScript.Run(
+		wheel.ctx,
+		wheel.client,
+		[]string{
+			wheel.name,
+			strconv.FormatInt(idx, 10),
+			strconv.FormatInt(int64(wheel.getTargetLockExpire().Seconds()), 10),
+		},
+		slice2interface(ids)...,
+	).StringSlice()
+	if err != nil {
+		return nil, err
+	}
+
+	return parseDecrTargetsResp(ss)
+}
+
 var getNeedClockTargetScript = redis.NewScript(`
 local name = KEYS[1]
 local idx = KEYS[2]
@@ -231,19 +326,22 @@ func (wheel *TimeWheel) getNeedClockTargets(idx int64) ([]string, error) {
 	return ts, nil
 }
 
-func (wheel *TimeWheel) proxy(ctx context.Context, idx int64, it func(idx int64, id string)) {
+func (wheel *TimeWheel) proxy(ctx context.Context, idx int64, run func(idx int64, ids []string)) {
 	ts, err := wheel.getNeedClockTargets(idx)
 	if err != nil {
 		return
 	}
 
-	// TODO: goroutine pool + wait group
-	for _, t := range ts {
+	if len(ts) == 0 {
+		return
+	}
+
+	for _, t := range splitIntoBatches(ts, wheel.batchSize) {
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			it(idx, t)
+			run(idx, t)
 		}
 	}
 }
@@ -395,18 +493,20 @@ func (wheel *TimeWheel) tickPos() int64 {
 }
 
 func (wheel *TimeWheel) exec(ctx context.Context, idx int64) {
-	wheel.proxy(ctx, idx, func(idx int64, id string) {
-		resp, err := wheel.autoClockTarget(idx, id)
+	wheel.proxy(ctx, idx, func(idx int64, ids []string) {
+		resp, err := wheel.autoClockTargets(idx, ids)
 		if err != nil {
 			return
 		}
-		if !resp.done {
-			return
-		}
-
-		wheel.donechan <- &Timer{
-			Id:      id,
-			Payload: resp.payload,
+		for id, payload := range resp {
+			select {
+			case <-ctx.Done():
+				return
+			case wheel.donechan <- &Timer{
+				Id:      id,
+				Payload: payload,
+			}: // do nothing
+			}
 		}
 	})
 }
