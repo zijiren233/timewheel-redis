@@ -53,8 +53,8 @@ func WithRetrySleep(retrySleep time.Duration) OptionFunc {
 	}
 }
 
-// retryMax == 0 means always retry
-// retryMax < 0 means never retry
+// retryMax == 0 means never retry
+// retryMax < 0 means always retry
 func WithRetryMax(retryMax int) OptionFunc {
 	return func(options *TimeWheel) {
 		options.retryMax = retryMax
@@ -98,9 +98,9 @@ func NewTimeWheel(client *redis.Client, name string, callback Callback, opts ...
 		slotNums:   60,
 		ctx:        context.Background(),
 		callback:   callback,
-		concurrent: 3,
+		concurrent: 5,
 		retrySleep: time.Second * 10,
-		retryMax:   0,
+		retryMax:   3,
 	}
 
 	for _, opt := range opts {
@@ -162,12 +162,9 @@ for _, id in ipairs(ARGV) do
 		redis.call("DEL", dl)
 	elseif redis.call("SET", dl, "", "NX", "EX", retry) then
 		local no_retry = false
-		if retry_max > 0 then
-			local retry_count = redis.call("HINCRBY", t, "retry_count", 1)
-			if retry_count > retry_max then
-				no_retry = true
-			end
-		elseif retry_max < 0 then
+		if retry_max == 0 then
+			no_retry = true
+		elseif retry_max > 0 and redis.call("HINCRBY", t, "retry_count", 1) > retry_max then
 			no_retry = true
 		end
 		local r = redis.call("HMGET", t, "payload")
