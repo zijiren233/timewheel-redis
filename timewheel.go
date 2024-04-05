@@ -356,8 +356,14 @@ local id = KEYS[2]
 local t = name .. ":t:" .. id
 local oldIdx = redis.call("HGET", t, "idx")
 if oldIdx then
-	local oldS = name .. ":s:" .. oldIdx
-	redis.call("SREM", oldS, id)
+	local d = name .. ":d"
+	if redis.call("SREM", d, id) then
+		local dl = name .. ":dl:" .. id
+		redis.call("DEL", dl)
+	else
+		local oldS = name .. ":s:" .. oldIdx
+		redis.call("SREM", oldS, id)
+	end
 end
 
 local idx = ARGV[1]
