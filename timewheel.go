@@ -134,17 +134,6 @@ redis.call("DEL", dl)
 return true
 `)
 
-func (wheel *TimeWheel) delTarget(id string) error {
-	return delTargetScript.Run(
-		wheel.ctx,
-		wheel.client,
-		[]string{
-			wheel.name,
-			id,
-		},
-	).Err()
-}
-
 var getDoneTargetsPayloadScript = redis.NewScript(`
 local name = KEYS[1]
 local idx = KEYS[2]
@@ -422,7 +411,70 @@ func (wheel *TimeWheel) AddTimer(id string, delay time.Duration, opts ...AddTime
 }
 
 func (wheel *TimeWheel) RemoveTimer(id string) error {
-	return wheel.delTarget(id)
+	return delTargetScript.Run(
+		wheel.ctx,
+		wheel.client,
+		[]string{
+			wheel.name,
+			id,
+		},
+	).Err()
+}
+
+func (wheel *TimeWheel) GetTimer(id string) (time.Duration, error) {
+	t, err := wheel.client.TTL(
+		wheel.ctx,
+		fmt.Sprintf("%s:tl:%s", wheel.name, id),
+	).Result()
+	if err != nil {
+		return 0, err
+	}
+	return t, nil
+}
+
+var resetTimerScript = redis.NewScript(`
+local name = KEYS[1]
+local id = KEYS[2]
+local t = name .. ":t:" .. id
+local idx = redis.call("HGET", t, "idx")
+if not idx then
+	return false
+end
+local d = name .. ":d"
+if redis.call("SISMEMBER", d, id) == 1 then
+	return false
+end
+local tl = name .. ":tl:" .. id
+redis.call("SET", tl, "", "EX", ARGV[2])
+local s = name .. ":s:" .. idx
+redis.call("SREM", s, id)
+local s = name .. ":s:" .. ARGV[1]
+redis.call("SADD", s, id)
+redis.call("HMSET", t, "idx", ARGV[1])
+return true
+`)
+
+func (wheel *TimeWheel) ResetTimer(id string, delay time.Duration) error {
+	if delay < 0 {
+		return fmt.Errorf("delay must be greater than 0")
+	}
+	if delay <= wheel.interval {
+		delay = wheel.interval
+	}
+
+	delaySec := int64(delay.Seconds())
+	idx := (atomic.LoadInt64(&wheel.currentPos) + delaySec/int64(wheel.interval.Seconds())) % wheel.slotNums
+
+	return resetTimerScript.Run(
+		wheel.ctx,
+		wheel.client,
+		[]string{
+			wheel.name,
+			id,
+		},
+		idx,
+		delaySec,
+	).Err()
 }
 
 func (wheel *TimeWheel) Run() {

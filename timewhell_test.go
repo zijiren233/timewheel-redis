@@ -59,6 +59,12 @@ func TestTimeWhell(t *testing.T) {
 	}
 	t.Logf("add timer test35")
 
+	err = tw.ResetTimer("test35", time.Second*40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("reset timer test35 to 40s")
+
 	now := time.Now()
 
 	timer := <-ch
@@ -75,6 +81,12 @@ func TestTimeWhell(t *testing.T) {
 	if timer.Id != "test35" {
 		t.Error("timer id not match")
 	}
+
+	d, err := tw.GetTimer("test60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("get timer test60, duration: %v", d)
 
 	timer = <-ch
 	t.Logf("cost time: %v", time.Since(now))
