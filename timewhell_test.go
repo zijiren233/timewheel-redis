@@ -18,14 +18,17 @@ func TestTimeWhell(t *testing.T) {
 	})
 	ch := make(chan *timewheel.Timer, 10)
 	firstFail := true
-	tw := timewheel.NewTimeWheel(rdb, "test-timewheel", func(t *timewheel.Timer) bool {
-		if firstFail {
-			firstFail = false
-			return false
-		}
-		ch <- t
-		return true
-	})
+	tw := timewheel.NewTimeWheel(
+		rdb, "test-timewheel",
+		func(t *timewheel.Timer) bool {
+			if firstFail {
+				firstFail = false
+				return false
+			}
+			ch <- t
+			return true
+		},
+	)
 	err := tw.AddTimer("test5", time.Second*5)
 	if err != nil {
 		t.Fatal(err)

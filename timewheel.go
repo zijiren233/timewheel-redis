@@ -53,6 +53,14 @@ func WithRetrySleep(retrySleep time.Duration) OptionFunc {
 	}
 }
 
+// retryMax == 0 means always retry
+// retryMax < 0 means never retry
+func WithRetryMax(retryMax int) OptionFunc {
+	return func(options *TimeWheel) {
+		options.retryMax = retryMax
+	}
+}
+
 type Timer struct {
 	Id      string
 	Payload []byte
@@ -72,6 +80,7 @@ type TimeWheel struct {
 	enableEvalRO bool
 	concurrent   int
 	retrySleep   time.Duration
+	retryMax     int
 }
 
 func NewTimeWheel(client *redis.Client, name string, callback Callback, opts ...OptionFunc) *TimeWheel {
@@ -91,6 +100,7 @@ func NewTimeWheel(client *redis.Client, name string, callback Callback, opts ...
 		callback:   callback,
 		concurrent: 3,
 		retrySleep: time.Second * 10,
+		retryMax:   0,
 	}
 
 	for _, opt := range opts {
@@ -139,27 +149,38 @@ return true
 
 var getDoneTargetsPayloadScript = redis.NewScript(`
 local name = KEYS[1]
-local idx = KEYS[2]
-local expire = KEYS[3]
-local retry = KEYS[4]
+local expire = KEYS[2]
+local retry = KEYS[3]
+local retry_max = tonumber(KEYS[4])
 local results = {}
 for _, id in ipairs(ARGV) do
-	local skip = false
 	local t = name .. ":t:" .. id
-	if redis.call("EXISTS", t) == 0 then
-		skip = true
-		redis.call("SREM", name .. ":d", id)
-	end
+	local d = name .. ":d"
 	local dl = name .. ":dl:" .. id
-	if not redis.call("SET", dl, "", "NX", "EX", retry) then
-		skip = true
-	end
-	if not skip then
+	if redis.call("EXISTS", t) == 0 then
+		redis.call("SREM", d, id)
+		redis.call("DEL", dl)
+	elseif redis.call("SET", dl, "", "NX", "EX", retry) then
+		local no_retry = false
+		if retry_max > 0 then
+			local retry_count = redis.call("HINCRBY", t, "retry_count", 1)
+			if retry_count > retry_max then
+				no_retry = true
+			end
+		elseif retry_max < 0 then
+			no_retry = true
+		end
 		local r = redis.call("HMGET", t, "payload")
 		if r then
-			redis.call("EXPIRE", t, expire)
 			table.insert(results, id)
 			table.insert(results, r[1])
+		end
+		if no_retry then
+			redis.call("DEL", dl)
+			redis.call("DEL", t)
+			redis.call("SREM", d, id)
+		else
+			redis.call("EXPIRE", t, expire)
 		end
 	end
 end
@@ -220,15 +241,15 @@ func slice2interface[T any](s []T) []interface{} {
 	return r
 }
 
-func (wheel *TimeWheel) getDoneTargetsPayload(idx int64, ids []string) (map[string][]byte, error) {
+func (wheel *TimeWheel) getDoneTargetsPayload(ids []string) (map[string][]byte, error) {
 	ss, err := getDoneTargetsPayloadScript.Run(
 		wheel.ctx,
 		wheel.client,
 		[]string{
 			wheel.name,
-			strconv.FormatInt(idx, 10),
 			strconv.FormatInt(int64(wheel.getTargetLockExpire().Seconds()), 10),
 			strconv.FormatInt(int64(wheel.retrySleep.Seconds()), 10),
+			strconv.FormatInt(int64(wheel.retryMax), 10),
 		},
 		slice2interface(ids)...,
 	).StringSlice()
@@ -349,13 +370,11 @@ local t = name .. ":t:" .. id
 local oldIdx = redis.call("HGET", t, "idx")
 if oldIdx then
 	local d = name .. ":d"
-	if redis.call("SREM", d, id) then
-		local dl = name .. ":dl:" .. id
-		redis.call("DEL", dl)
-	else
-		local oldS = name .. ":s:" .. oldIdx
-		redis.call("SREM", oldS, id)
-	end
+	redis.call("SREM", d, id)
+	local dl = name .. ":dl:" .. id
+	redis.call("DEL", dl)
+	local oldS = name .. ":s:" .. oldIdx
+	redis.call("SREM", oldS, id)
 end
 
 local idx = ARGV[1]
@@ -506,7 +525,7 @@ func (wheel *TimeWheel) tickPos() int64 {
 
 func (wheel *TimeWheel) exec(ctx context.Context, idx int64) {
 	wheel.proxy(ctx, idx, func(idx int64, ids []string) {
-		resp, err := wheel.getDoneTargetsPayload(idx, ids)
+		resp, err := wheel.getDoneTargetsPayload(ids)
 		if err != nil {
 			return
 		}
