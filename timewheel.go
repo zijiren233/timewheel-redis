@@ -38,18 +38,18 @@ func WithEnableEvalRO(enableEvalRO bool) OptionFunc {
 	}
 }
 
-func WithBatchSize(batchSize int) OptionFunc {
+func WithConcurrent(concurrent int) OptionFunc {
 	return func(options *TimeWheel) {
-		if batchSize < 1 {
+		if concurrent < 1 {
 			return
 		}
-		options.batchSize = batchSize
+		options.concurrent = concurrent
 	}
 }
 
-func WithRetry(retry time.Duration) OptionFunc {
+func WithRetrySleep(retrySleep time.Duration) OptionFunc {
 	return func(options *TimeWheel) {
-		options.retry = retry
+		options.retrySleep = retrySleep
 	}
 }
 
@@ -70,24 +70,27 @@ type TimeWheel struct {
 	cancel       context.CancelFunc
 	callback     Callback
 	enableEvalRO bool
-	batchSize    int
-	retry        time.Duration
+	concurrent   int
+	retrySleep   time.Duration
 }
 
 func NewTimeWheel(client *redis.Client, name string, callback Callback, opts ...OptionFunc) *TimeWheel {
 	if client == nil || len(name) == 0 {
 		panic("client and name must not be nil")
 	}
+	if callback == nil {
+		panic("callback must not be nil")
+	}
 
 	timewheel := &TimeWheel{
-		client:    client,
-		name:      name,
-		interval:  time.Second,
-		slotNums:  60,
-		ctx:       context.Background(),
-		callback:  callback,
-		batchSize: 3,
-		retry:     time.Second * 10,
+		client:     client,
+		name:       name,
+		interval:   time.Second,
+		slotNums:   60,
+		ctx:        context.Background(),
+		callback:   callback,
+		concurrent: 3,
+		retrySleep: time.Second * 10,
 	}
 
 	for _, opt := range opts {
@@ -225,7 +228,7 @@ func (wheel *TimeWheel) getDoneTargetsPayload(idx int64, ids []string) (map[stri
 			wheel.name,
 			strconv.FormatInt(idx, 10),
 			strconv.FormatInt(int64(wheel.getTargetLockExpire().Seconds()), 10),
-			strconv.FormatInt(int64(wheel.retry.Seconds()), 10),
+			strconv.FormatInt(int64(wheel.retrySleep.Seconds()), 10),
 		},
 		slice2interface(ids)...,
 	).StringSlice()
@@ -292,7 +295,7 @@ func (wheel *TimeWheel) proxy(ctx context.Context, idx int64, run func(idx int64
 		return
 	}
 
-	for _, t := range splitIntoBatches(ts, wheel.batchSize) {
+	for _, t := range splitIntoBatches(ts, wheel.concurrent) {
 		select {
 		case <-ctx.Done():
 			return
