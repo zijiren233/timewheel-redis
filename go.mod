@@ -4,7 +4,7 @@ go 1.18
 
 require (
 	github.com/klauspost/compress v1.17.7
-	github.com/redis/go-redis/v9 v9.5.1
+	github.com/redis/go-redis/v9 v9.5.5
 )
 
 require (
