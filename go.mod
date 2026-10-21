@@ -1,9 +1,9 @@
 module github.com/zijiren233/timewheel-redis
 
-go 1.18
+go 1.24
 
 require (
-	github.com/klauspost/compress v1.17.7
+	github.com/klauspost/compress v1.18.7
 	github.com/redis/go-redis/v9 v9.5.1
 )
 
